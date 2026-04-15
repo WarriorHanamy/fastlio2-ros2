@@ -98,12 +98,15 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
+bool    apply_lidar_initial_attitude = false;
 
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
 vector<double>       extrinT(3, 0.0);
 vector<double>       extrinR(9, 0.0);
+vector<double>       lidar_initial_attitude(9, 0.0);
+M3D                  lidar_initial_attitude_mat;
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::msg::Imu::ConstSharedPtr> imu_buffer;
@@ -613,16 +616,18 @@ void save_to_pcd()
 }
 
 template<typename T>
-void set_posestamp(T & out)
+void set_posestamp(T & out, const M3D &rot_mat)
 {
-    out.pose.position.x = state_point.pos(0);
-    out.pose.position.y = state_point.pos(1);
-    out.pose.position.z = state_point.pos(2);
-    out.pose.orientation.x = geoQuat.x;
-    out.pose.orientation.y = geoQuat.y;
-    out.pose.orientation.z = geoQuat.z;
-    out.pose.orientation.w = geoQuat.w;
+    V3D rotated_pos = rot_mat * state_point.pos;
+    out.pose.position.x = rotated_pos(0);
+    out.pose.position.y = rotated_pos(1);
+    out.pose.position.z = rotated_pos(2);
     
+    Eigen::Quaterniond rotated_quat(rot_mat * state_point.rot.toRotationMatrix());
+    out.pose.orientation.x = rotated_quat.x();
+    out.pose.orientation.y = rotated_quat.y();
+    out.pose.orientation.z = rotated_quat.z();
+    out.pose.orientation.w = rotated_quat.w();
 }
 
 void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
@@ -630,7 +635,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
     odomAftMapped.header.stamp = get_ros_time(lidar_end_time);
-    set_posestamp(odomAftMapped.pose);
+    set_posestamp(odomAftMapped.pose, lidar_initial_attitude_mat);
     pubOdomAftMapped->publish(odomAftMapped);
     auto P = kf.get_P();
     for (int i = 0; i < 6; i ++)
@@ -660,7 +665,7 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
 {
-    set_posestamp(msg_body_pose);
+    set_posestamp(msg_body_pose, lidar_initial_attitude_mat);
     msg_body_pose.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
     msg_body_pose.header.frame_id = "camera_init";
 
@@ -833,6 +838,7 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        this->declare_parameter<vector<double>>("mapping.lidar_initial_attitude", vector<double>());
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
@@ -869,6 +875,9 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter_or<vector<double>>("mapping.lidar_initial_attitude", lidar_initial_attitude, vector<double>());
+
+        apply_lidar_initial_attitude = (imu_topic == "/livox/imu");
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -900,6 +909,28 @@ public:
         p_imu->set_gyr_bias_cov(V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
+        // Parse lidar_initial_attitude parameter
+        if (!lidar_initial_attitude.empty()) {
+            lidar_initial_attitude_mat << MAT_FROM_ARRAY(lidar_initial_attitude);
+        } else {
+            lidar_initial_attitude_mat.setIdentity();
+        }
+
+        // Override to identity if not applying (e.g., when imu_topic is not /livox/imu)
+        if (!apply_lidar_initial_attitude) {
+            lidar_initial_attitude_mat.setIdentity();
+        }
+
+        // Log the lidar_initial_attitude matrix
+        if (!lidar_initial_attitude.empty()) {
+            RCLCPP_INFO(this->get_logger(), "lidar_initial_attitude: %f %f %f %f %f %f %f %f %f",
+                        lidar_initial_attitude[0], lidar_initial_attitude[1], lidar_initial_attitude[2],
+                        lidar_initial_attitude[3], lidar_initial_attitude[4], lidar_initial_attitude[5],
+                        lidar_initial_attitude[6], lidar_initial_attitude[7], lidar_initial_attitude[8]);
+        } else {
+            RCLCPP_INFO(this->get_logger(), "lidar_initial_attitude: using default identity");
+        }
+
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
@@ -926,7 +957,9 @@ public:
         {
             sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk);
+        auto imu_qos = rclcpp::SensorDataQoS();
+        imu_qos.keep_last(40);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, imu_qos, imu_cbk);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
