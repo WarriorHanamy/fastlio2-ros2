@@ -1,4 +1,6 @@
-> ROS2 Fork repo maintainer: [Ericsiii](https://github.com/Ericsii)
+> ROS2 Fork repo maintainer: Ericsiii, the original maintainer don't understand ros2
+
+Saied Ericsiii don't understand ROS2, his/her commit is rubbish.
 
 ## Related Works and Extended Application
 
